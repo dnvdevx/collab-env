@@ -5,7 +5,10 @@ For local dev we use SQLite; swap DATABASE_URL for Postgres in production
 """
 
 import os
+from dotenv import load_dotenv
 from sqlmodel import SQLModel, Session, create_engine
+
+load_dotenv()  # reads a .env file in the project root, if present, into os.environ
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./mission_control.db")
 

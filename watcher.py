@@ -101,10 +101,11 @@ class CheckpointHandler(FileSystemEventHandler):
     not a burst of them."""
 
     def __init__(self, repo_path: Path, feature_id: int, backend_url: str,
-                 run_command: str | None, debounce_seconds: float = 2.0):
+                 token: str, run_command: str | None, debounce_seconds: float = 2.0):
         self.repo_path = repo_path
         self.feature_id = feature_id
         self.backend_url = backend_url
+        self.token = token
         self.run_command = run_command
         self.debounce_seconds = debounce_seconds
         self._last_event_time = 0.0
@@ -146,7 +147,12 @@ class CheckpointHandler(FileSystemEventHandler):
         }
 
         try:
-            resp = requests.post(f"{self.backend_url}/checkpoints", json=payload, timeout=5)
+            resp = requests.post(
+                f"{self.backend_url}/checkpoints",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=5,
+            )
             if resp.status_code == 200:
                 print(f"[checkpoint sent] {stats['files_changed']} files, "
                       f"+{stats['lines_added']}/-{stats['lines_removed']}, run={run_status}")
@@ -160,6 +166,8 @@ def main():
     parser = argparse.ArgumentParser(description="Mission Control local watcher")
     parser.add_argument("--feature-id", type=int, required=True,
                          help="The feature ID this checkpoint stream belongs to (from /features)")
+    parser.add_argument("--token", required=True,
+                         help="Your access token from /auth/login or /auth/signup")
     parser.add_argument("--backend-url", default="http://localhost:8000",
                          help="Base URL of the Mission Control API")
     parser.add_argument("--path", default=".", help="Folder to watch (must be a git repo)")
@@ -177,6 +185,7 @@ def main():
         repo_path=repo_path,
         feature_id=args.feature_id,
         backend_url=args.backend_url,
+        token=args.token,
         run_command=args.run_command,
     )
 
