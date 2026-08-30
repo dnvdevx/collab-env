@@ -9,14 +9,15 @@ asking for, instead of trusting a raw user_id in the request body).
 from datetime import datetime
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlmodel import Session, select
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
-from database import create_db_and_tables, get_session
+from database import create_db_and_tables, get_session, engine
 from models import User, Team, Membership, Feature, Checkpoint, Milestone, Comment, Role, RunStatus
 from auth import hash_password, verify_password, create_access_token, decode_access_token
+from connection_manager import manager
 
 app = FastAPI(title="Mission Control API")
 
@@ -34,7 +35,8 @@ def on_startup():
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    session: Session = Depends(get_session), ) -> User:
+    session: Session = Depends(get_session),
+) -> User:
     token = credentials.credentials
     user_id = decode_access_token(token)
     if user_id is None:
@@ -351,17 +353,60 @@ def get_dashboard(
     return {"team_id": team_id, "team_name": team.name, "tiles": tiles}
 
 
+# ---------- WebSocket: live dashboard updates ----------
+
+@app.websocket("/ws/teams/{team_id}")
+async def team_dashboard_socket(websocket: WebSocket, team_id: int, token: str):
+    """A dashboard connects here to receive live checkpoint updates for a team,
+    instead of polling /teams/{id}/dashboard on a timer.
+
+    Auth note: browsers can't attach custom headers to a WebSocket handshake,
+    so the token is passed as a query param (?token=...) instead of the usual
+    Authorization header. Over wss:// (TLS) in production this is as safe as
+    a header - it's just carried differently, not less secure.
+    """
+    user_id = decode_access_token(token)
+    if user_id is None:
+        await websocket.close(code=4401, reason="Invalid or expired token")
+        return
+
+    # Verify membership before accepting the connection - an unauthenticated
+    # or non-member socket should never get to listen in on this team's data.
+    with Session(engine) as session:
+        user = session.get(User, user_id)
+        if not user:
+            await websocket.close(code=4401, reason="User no longer exists")
+            return
+
+        membership = session.exec(
+            select(Membership).where(Membership.team_id == team_id, Membership.user_id == user_id)
+        ).first()
+        if not membership:
+            await websocket.close(code=4403, reason="Not a member of this team")
+            return
+
+    await manager.connect(team_id, websocket)
+    try:
+        while True:
+            # We don't expect the client to send anything meaningful, but we
+            # must keep reading so we notice when they disconnect.
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(team_id, websocket)
+
+
 # ---------- Checkpoints ----------
 
 @app.post("/checkpoints", response_model=CheckpointRead)
-def create_checkpoint(
+async def create_checkpoint(
     req: CheckpointCreate,
     current_user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Called by the watcher script (which now needs an access token - see
-    watcher.py's --token argument) on each save. Stores a checkpoint and
-    enforces the team's retention policy."""
+    watcher.py's --token argument) on each save. Stores a checkpoint,
+    enforces the team's retention policy, and pushes a live update to any
+    dashboard currently open for this team."""
     feature = session.get(Feature, req.feature_id)
     if not feature:
         raise HTTPException(404, "Feature not found")
@@ -398,6 +443,20 @@ def create_checkpoint(
             for old in all_checkpoints[keep_n:]:
                 session.delete(old)
             session.commit()
+
+    # Push a live update to any dashboard currently open for this team, so
+    # the lead sees the new checkpoint without needing to refresh.
+    await manager.broadcast_to_team(feature.team_id, {
+        "type": "checkpoint_created",
+        "feature_id": feature.id,
+        "feature_name": feature.name,
+        "owner_name": current_user.name,
+        "run_status": checkpoint.run_status,
+        "files_changed": checkpoint.files_changed,
+        "lines_added": checkpoint.lines_added,
+        "lines_removed": checkpoint.lines_removed,
+        "created_at": checkpoint.created_at.isoformat(),
+    })
 
     return checkpoint
 
